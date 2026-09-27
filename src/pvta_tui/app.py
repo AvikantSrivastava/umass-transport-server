@@ -7,13 +7,15 @@ from pathlib import Path
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Static, Input, Label, DataTable, Button
+from textual.widgets import Header, Footer, Static, Input, Label, DataTable, Button, OptionList
+from textual.widgets.option_list import Option
 from textual.binding import Binding
 from textual.message import Message
 
 from .gtfs_loader import GTFSData, load_gtfs, load_cache, save_cache
 from .realtime import RealtimeData, fetch_realtime, Alert
 from .departures import get_departures, format_minutes_until, Departure
+from .data_fetcher import get_data_dir, DATA_DIR
 
 # MVP Configuration
 ROUTE_ID = "31"
@@ -21,7 +23,6 @@ ORIGIN_STOP_ID = "157"  # The Boulders Apts
 DEST_STOP_ID = "72"     # Studio Arts Building
 DIRECTION_ID = 0        # Sunderland-bound (passes through UMass)
 
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
 CACHE_PATH = DATA_DIR / "gtfs_cache.pkl"
 
 REFRESH_INTERVAL = 5  # seconds
@@ -41,68 +42,58 @@ class AlertBanner(Static):
             self.remove_class("visible")
 
 
-def format_date_label(d: date) -> str:
-    """Format date as 'month day' (e.g., 'november 6')."""
+def format_date_label(d: date, include_day: bool = True) -> str:
+    """Format date as 'monday, november 6' or 'november 6'."""
+    if include_day:
+        return d.strftime("%A, %B %d").lower().replace(" 0", " ")
     return d.strftime("%B %d").lower().replace(" 0", " ")
 
 
+def get_date_label(d: date) -> str:
+    """Get display label for a date (Today, Tomorrow, or weekday name)."""
+    today = date.today()
+    if d == today:
+        return f"Today - {format_date_label(d)}"
+    elif d == today + timedelta(days=1):
+        return f"Tomorrow - {format_date_label(d)}"
+    else:
+        return format_date_label(d).title()
+
+
 class DateSelector(Static):
-    """Date selector for choosing query date."""
+    """Scrollable date selector."""
+
+    NUM_DAYS = 14  # Show 2 weeks of dates
 
     def __init__(self):
         super().__init__()
         self.selected_date: date = date.today()
+        self._dates: list[date] = []
 
     def compose(self) -> ComposeResult:
         today = date.today()
-        tomorrow = today + timedelta(days=1)
-        yield Horizontal(
-            Button(f"Today ({format_date_label(today)})", id="date-today", variant="primary"),
-            Button(f"Tomorrow ({format_date_label(tomorrow)})", id="date-tomorrow"),
-            Input(placeholder="or enter date: november 6", id="date-input"),
-            classes="date-row",
-        )
+        self._dates = [today + timedelta(days=i) for i in range(self.NUM_DAYS)]
+
+        options = [
+            Option(get_date_label(d), id=d.isoformat())
+            for d in self._dates
+        ]
+
+        yield OptionList(*options, id="date-picker")
+
+    def on_mount(self) -> None:
+        picker = self.query_one("#date-picker", OptionList)
+        picker.highlighted = 0  # Start with today highlighted
 
     def get_selected_date(self) -> date:
         return self.selected_date
 
-    def _update_buttons(self, selected_id: str) -> None:
-        """Update button variants to show selection."""
-        for btn_id in ["date-today", "date-tomorrow"]:
-            btn = self.query_one(f"#{btn_id}", Button)
-            btn.variant = "primary" if btn_id == selected_id else "default"
-
-    @on(Button.Pressed, "#date-today")
-    def select_today(self) -> None:
-        self.selected_date = date.today()
-        self._update_buttons("date-today")
-        self.post_message(self.DateChanged(self.selected_date))
-
-    @on(Button.Pressed, "#date-tomorrow")
-    def select_tomorrow(self) -> None:
-        self.selected_date = date.today() + timedelta(days=1)
-        self._update_buttons("date-tomorrow")
-        self.post_message(self.DateChanged(self.selected_date))
-
-    @on(Input.Submitted, "#date-input")
-    def parse_custom_date(self, event: Input.Submitted) -> None:
-        """Parse custom date input like 'november 6'."""
-        text = event.value.strip().lower()
-        if not text:
-            return
-
-        try:
-            # Try parsing "month day" format
-            current_year = date.today().year
-            parsed = datetime.strptime(f"{text} {current_year}", "%B %d %Y").date()
-            # If the date is in the past, assume next year
-            if parsed < date.today():
-                parsed = parsed.replace(year=current_year + 1)
-            self.selected_date = parsed
-            self._update_buttons("")  # Deselect both buttons
+    @on(OptionList.OptionSelected, "#date-picker")
+    def on_date_selected(self, event: OptionList.OptionSelected) -> None:
+        """Handle date selection from the list."""
+        if event.option.id:
+            self.selected_date = date.fromisoformat(event.option.id)
             self.post_message(self.DateChanged(self.selected_date))
-        except ValueError:
-            pass  # Invalid date format, ignore
 
     class DateChanged(Message):
         """Message sent when date selection changes."""
@@ -208,17 +199,22 @@ class PVTAApp(App):
         padding-top: 1;
     }
 
-    .date-row {
-        height: 3;
+    DateSelector {
+        height: 5;
         padding: 0 1;
     }
 
-    .date-row Button {
-        margin-right: 1;
+    #date-picker {
+        height: 100%;
+        scrollbar-size: 1 1;
     }
 
-    .date-row Input {
-        width: 1fr;
+    #date-picker > .option-list--option-highlighted {
+        background: $primary;
+    }
+
+    #date-picker > .option-list--option-selected {
+        background: $primary-darken-1;
     }
 
     AlertBanner {
@@ -305,7 +301,9 @@ class PVTAApp(App):
         self.gtfs = load_cache(CACHE_PATH)
         if self.gtfs is None:
             status.update_status(None, None)
-            self.gtfs = load_gtfs(DATA_DIR)
+            # Fetch data if needed, then load
+            data_dir = get_data_dir()
+            self.gtfs = load_gtfs(data_dir)
             save_cache(self.gtfs, CACHE_PATH)
 
         # Initial refresh
