@@ -1,0 +1,14 @@
+[project]
+name = "pvta-tui"
+version = "0.1.0"
+description = "PVTA real-time bus arrivals TUI"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "gtfs-realtime-bindings>=3.0.0",
+    "httpx>=0.28.1",
+    "textual>=8.2.8",
+]
+
+[project.scripts]
+pvta = "src.pvta_tui.app:main"
