@@ -7,21 +7,24 @@ from pathlib import Path
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Static, Input, Label, DataTable, Button, OptionList
+from textual.widgets import Header, Footer, Static, Input, Label, DataTable, Button, OptionList, Digits
 from textual.widgets.option_list import Option
 from textual.binding import Binding
 from textual.message import Message
+from textual.screen import ModalScreen
+from pyfiglet import Figlet
 
-from .gtfs_loader import GTFSData, load_gtfs, load_cache, save_cache
+from .gtfs_loader import GTFSData, Stop, load_gtfs, load_cache, save_cache
 from .realtime import RealtimeData, fetch_realtime, Alert
 from .departures import get_departures, format_minutes_until, Departure
 from .data_fetcher import get_data_dir, DATA_DIR
 
 # MVP Configuration
 ROUTE_ID = "31"
-ORIGIN_STOP_ID = "157"  # The Boulders Apts
-DEST_STOP_ID = "72"     # Studio Arts Building
-DIRECTION_ID = 0        # Sunderland-bound (passes through UMass)
+DEFAULT_ORIGIN_STOP_ID = "157"  # The Boulders Apts
+DEFAULT_DEST_STOP_ID = "72"     # Studio Arts Building
+# Either direction: trips are kept only if destination comes after origin
+DIRECTION_ID = None
 
 CACHE_PATH = DATA_DIR / "gtfs_cache.pkl"
 
@@ -103,15 +106,89 @@ class DateSelector(Static):
 
 
 class SearchBox(Static):
-    """Search input for source/destination (placeholder for v1)."""
+    """Shows the selected source/destination; press s / d to change them."""
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
-            Input(placeholder="From: The Boulders Apts", id="from-input", disabled=True),
+            Input(placeholder="From: The Boulders Apts  [s]", id="from-input", disabled=True),
             Static("→", classes="arrow"),
-            Input(placeholder="To: UMass (Studio Arts)", id="to-input", disabled=True),
+            Input(placeholder="To: UMass (Studio Arts)  [d]", id="to-input", disabled=True),
             classes="search-row",
         )
+
+    def set_stops(self, origin_name: str, dest_name: str) -> None:
+        self.query_one("#from-input", Input).value = f"From: {origin_name}  [s]"
+        self.query_one("#to-input", Input).value = f"To: {dest_name}  [d]"
+
+
+class StopPickerScreen(ModalScreen[str | None]):
+    """Large modal window for picking a stop. Returns the stop_id, or None."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("down", "cursor_down", show=False),
+        Binding("up", "cursor_up", show=False),
+    ]
+
+    def __init__(self, title: str, stops: list[Stop], current_stop_id: str):
+        super().__init__()
+        self.picker_title = title
+        self.stops = stops
+        self.current_stop_id = current_stop_id
+
+    def compose(self) -> ComposeResult:
+        # Terminals can't change font size, so render the title as ASCII art
+        width = max(self.app.size.width - 16, 40)
+        banner = Figlet(font="small", width=width).renderText(self.picker_title).rstrip()
+        with Vertical(id="picker-dialog"):
+            yield Static(banner, id="picker-title")
+            yield Input(placeholder="Type to filter stops…", id="picker-filter")
+            yield OptionList(id="picker-list")
+            yield Static("↑/↓ move   Enter select   Esc cancel", id="picker-hint")
+
+    def on_mount(self) -> None:
+        self._populate("")
+        self.query_one("#picker-filter", Input).focus()
+
+    def _populate(self, query: str) -> None:
+        picker = self.query_one("#picker-list", OptionList)
+        picker.clear_options()
+        query = query.strip().lower()
+        matches = [s for s in self.stops if query in s.stop_name.lower()]
+        # Blank lines around each name make every row three lines tall
+        picker.add_options(
+            Option(
+                f"\n  ● {s.stop_name}\n" if s.stop_id == self.current_stop_id else f"\n    {s.stop_name}\n",
+                id=s.stop_id,
+            )
+            for s in matches
+        )
+        if matches:
+            ids = [s.stop_id for s in matches]
+            picker.highlighted = ids.index(self.current_stop_id) if self.current_stop_id in ids else 0
+
+    @on(Input.Changed, "#picker-filter")
+    def on_filter_changed(self, event: Input.Changed) -> None:
+        self._populate(event.value)
+
+    @on(Input.Submitted, "#picker-filter")
+    def on_filter_submitted(self) -> None:
+        picker = self.query_one("#picker-list", OptionList)
+        if picker.highlighted is not None:
+            self.dismiss(picker.get_option_at_index(picker.highlighted).id)
+
+    @on(OptionList.OptionSelected, "#picker-list")
+    def on_stop_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#picker-list", OptionList).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#picker-list", OptionList).action_cursor_up()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class DepartureList(Static):
@@ -163,6 +240,17 @@ class DepartureList(Static):
             table.add_row(dep_mins, status, headsign, arr_time)
 
 
+class Clock(Digits):
+    """Large digital clock, ticking every second."""
+
+    def on_mount(self) -> None:
+        self.tick()
+        self.set_interval(1, self.tick)
+
+    def tick(self) -> None:
+        self.update(datetime.now().strftime("%H:%M:%S"))
+
+
 class StatusBar(Static):
     """Status bar showing last update time."""
 
@@ -182,6 +270,13 @@ class PVTAApp(App):
     CSS = """
     Screen {
         layout: vertical;
+    }
+
+    Clock {
+        width: 100%;
+        text-align: center;
+        color: $accent;
+        text-style: bold;
     }
 
     .search-row {
@@ -261,11 +356,54 @@ class PVTAApp(App):
     DataTable > .datatable--cursor {
         background: $primary-darken-1;
     }
+
+    StopPickerScreen {
+        align: center middle;
+        background: $background 60%;
+    }
+
+    #picker-dialog {
+        width: 90%;
+        height: 90%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #picker-title {
+        width: 100%;
+        height: auto;
+        content-align: center middle;
+        text-align: center;
+        color: $accent;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #picker-filter {
+        margin-bottom: 1;
+    }
+
+    #picker-list {
+        height: 1fr;
+    }
+
+    #picker-list > .option-list--option {
+        text-style: bold;
+    }
+
+    #picker-hint {
+        height: 1;
+        text-align: center;
+        color: $text-muted;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("s", "select_origin", "Origin"),
+        Binding("d", "select_destination", "Destination"),
     ]
 
     def __init__(self):
@@ -273,14 +411,17 @@ class PVTAApp(App):
         self.gtfs: GTFSData | None = None
         self.realtime: RealtimeData | None = None
         self._refresh_task: asyncio.Task | None = None
+        self.origin_stop_id = DEFAULT_ORIGIN_STOP_ID
+        self.dest_stop_id = DEFAULT_DEST_STOP_ID
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Clock()
         yield SearchBox()
         yield DateSelector()
         yield AlertBanner()
         yield Container(
-            Label(f"Route 31: The Boulders → UMass", id="route-header"),
+            Label(f"Route {ROUTE_ID}: The Boulders → UMass", id="route-header"),
             DepartureList(),
             id="main-container",
         )
@@ -305,6 +446,8 @@ class PVTAApp(App):
             data_dir = get_data_dir()
             self.gtfs = load_gtfs(data_dir)
             save_cache(self.gtfs, CACHE_PATH)
+
+        self.update_signboard()
 
         # Initial refresh
         await self.do_refresh()
@@ -346,8 +489,8 @@ class PVTAApp(App):
                     self.gtfs,
                     realtime_data,
                     ROUTE_ID,
-                    ORIGIN_STOP_ID,
-                    DEST_STOP_ID,
+                    self.origin_stop_id,
+                    self.dest_stop_id,
                     DIRECTION_ID,
                     query_time,
                 )
@@ -361,6 +504,43 @@ class PVTAApp(App):
     def action_refresh(self) -> None:
         """Manual refresh."""
         asyncio.create_task(self.do_refresh())
+
+    def update_signboard(self) -> None:
+        """Show the selected origin/destination in the header and search box."""
+        if not self.gtfs:
+            return
+        origin = self.gtfs.stops[self.origin_stop_id].stop_name
+        dest = self.gtfs.stops[self.dest_stop_id].stop_name
+        self.query_one("#route-header", Label).update(f"Route {ROUTE_ID}: {origin} → {dest}")
+        self.query_one(SearchBox).set_stops(origin, dest)
+
+    def _open_stop_picker(self, title: str, current_stop_id: str, is_origin: bool) -> None:
+        if not self.gtfs or isinstance(self.screen, StopPickerScreen):
+            return
+
+        def on_picked(stop_id: str | None) -> None:
+            if stop_id is None:
+                return
+            if is_origin:
+                # Picking the current destination as origin swaps the two
+                if stop_id == self.dest_stop_id:
+                    self.dest_stop_id = self.origin_stop_id
+                self.origin_stop_id = stop_id
+            else:
+                if stop_id == self.origin_stop_id:
+                    self.origin_stop_id = self.dest_stop_id
+                self.dest_stop_id = stop_id
+            self.update_signboard()
+            asyncio.create_task(self.do_refresh())
+
+        stops = self.gtfs.get_route_stops(ROUTE_ID)
+        self.push_screen(StopPickerScreen(title, stops, current_stop_id), on_picked)
+
+    def action_select_origin(self) -> None:
+        self._open_stop_picker("Select Origin", self.origin_stop_id, is_origin=True)
+
+    def action_select_destination(self) -> None:
+        self._open_stop_picker("Select Destination", self.dest_stop_id, is_origin=False)
 
     @on(DateSelector.DateChanged)
     def on_date_changed(self, event: DateSelector.DateChanged) -> None:
