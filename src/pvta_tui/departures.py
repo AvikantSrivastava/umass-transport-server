@@ -30,7 +30,7 @@ def _get_departures_for_service_date(
     route_id: str,
     origin_stop_id: str,
     dest_stop_id: str,
-    direction_id: int,
+    direction_id: int | None,
     service_date: date,
     query_time: datetime,
 ) -> list[Departure]:
@@ -42,7 +42,7 @@ def _get_departures_for_service_date(
         # Filter by route and direction
         if trip.route_id != route_id:
             continue
-        if trip.direction_id != direction_id:
+        if direction_id is not None and trip.direction_id != direction_id:
             continue
         if trip.service_id not in active_services:
             continue
@@ -122,7 +122,7 @@ def get_departures(
     route_id: str,
     origin_stop_id: str,
     dest_stop_id: str,
-    direction_id: int,
+    direction_id: int | None,
     query_time: datetime | None = None,
 ) -> list[Departure]:
     """Get upcoming departures from origin to destination.
@@ -133,7 +133,7 @@ def get_departures(
         route_id: Route to filter by
         origin_stop_id: Starting stop
         dest_stop_id: Ending stop
-        direction_id: Direction to filter (0 or 1)
+        direction_id: Direction to filter (0 or 1), or None for either
         query_time: Time to query from (defaults to now)
 
     Returns:

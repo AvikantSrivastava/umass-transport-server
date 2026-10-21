@@ -68,6 +68,29 @@ class GTFSData:
 
         return active
 
+    def get_route_stops(self, route_id: str) -> list[Stop]:
+        """Get stops served by a route, in travel order.
+
+        Walks the longest trip in each direction (0 first, then 1), so stops
+        appear in the order a rider would pass them.
+        """
+        longest: dict[int, list[StopTime]] = {}
+        for trip_id, trip in self.trips.items():
+            if trip.route_id != route_id:
+                continue
+            sts = self.stop_times.get(trip_id, [])
+            if len(sts) > len(longest.get(trip.direction_id, [])):
+                longest[trip.direction_id] = sts
+
+        ordered: list[Stop] = []
+        seen: set[str] = set()
+        for direction_id in sorted(longest):
+            for st in longest[direction_id]:
+                if st.stop_id not in seen and st.stop_id in self.stops:
+                    seen.add(st.stop_id)
+                    ordered.append(self.stops[st.stop_id])
+        return ordered
+
 
 def parse_gtfs_time(time_str: str) -> timedelta:
     """Parse GTFS time (can exceed 24:00:00) to timedelta from midnight."""
